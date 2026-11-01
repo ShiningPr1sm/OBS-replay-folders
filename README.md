@@ -22,30 +22,6 @@ The notification does not steal focus from your game, ignores mouse clicks and d
 
 ---
 
-## Result
-
-With the game sorting enabled:
-
-```
-HUB/
-├── Witcher3/
-│   └── 01_11_2026/
-│       └── 12_30_05.mkv
-└── Elden Ring/
-    └── 01_11_2026/
-        └── 18_02_44.mkv
-```
-
-With the game sorting disabled, replays stay where OBS puts them:
-
-```
-HUB/
-└── 01_11_2026/
-    └── 12_30_05.mkv
-```
-
----
-
 ## Installation
 
 1. Put all files in a folder where you have write access, **not** in `C:\Program Files\...`.
@@ -93,6 +69,30 @@ Save a replay the way you normally do. The script reacts to OBS's "replay buffer
 - the extra hotkey **Save replay buffer (ReplayFolders script)**, which appears in the same Hotkeys list once the script is loaded.
 
 After the replay is saved, the script detects the fullscreen game, moves the file into `Game/date/` and shows the notification.
+
+---
+
+## Result
+
+With the game sorting enabled:
+
+```
+HUB/
+├── Witcher3/
+│   └── 01_11_2026/
+│       └── 12_30_05.mkv
+└── Elden Ring/
+    └── 01_11_2026/
+        └── 18_02_44.mkv
+```
+
+With the game sorting disabled, replays stay where OBS puts them:
+
+```
+HUB/
+└── 01_11_2026/
+    └── 12_30_05.mkv
+```
 
 ---
 
