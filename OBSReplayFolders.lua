@@ -4,7 +4,8 @@ function script_description()
     return [[Saves replays to sub-folders using the current fullscreen video game executable name.
 
 Author: redraskal, modified by ShiningPr1sm (Now includes custom names from "custom_names.txt")
-+ "Replay saved!" overlay notification (green box, top-right)]]
++ "Replay saved!" overlay notification (green box, top-right)
++ Non-game windows: focused program name as folder (Discord...), system/shell windows -> Desktop]]
 end
 
 -- =====================================================================
@@ -42,10 +43,47 @@ function rename_game_title(original_title)
 end
 
 -- =====================================================================
+-- Programs that are never treated as a game (optional file: ignored_programs.txt)
+-- =====================================================================
+
+local fallback_folder = "Desktop"   -- folder for clips when no game is detected ("" = do not move)
+
+local ignored_exes = {}
+
+local function load_ignored_programs()
+    -- built-in list: windows that often look like a "fullscreen game" to detect_game.dll
+    local defaults = {
+        "ms-teams", "teams", "msedgewebview2", "microsoftstartfeedprovider",
+        "widgets", "widgetservice", "searchhost", "startmenuexperiencehost",
+        "shellexperiencehost", "textinputhost", "applicationframehost",
+        "gamebar", "xboxgamebarwidgets", "explorer", "systemsettings", "lockapp",
+        "obs64", "obs32", "obs",
+    }
+    for _, name in ipairs(defaults) do
+        ignored_exes[name] = true
+    end
+
+    local path = script_path() .. "ignored_programs.txt"
+    local file = io.open(path, "r")
+    if file then
+        print("Loading ignored programs from: " .. path)
+        for line in file:lines() do
+            line = line:match("^%s*(.-)%s*$")
+            if line ~= "" and line:sub(1, 1) ~= "#" and line:sub(1, 1) ~= ";" then
+                line = line:gsub("%.[eE][xX][eE]$", ""):lower()
+                ignored_exes[line] = true
+            end
+        end
+        file:close()
+    end
+end
+
+-- =====================================================================
 -- "Replay saved!" overlay (green box, top-right of the canvas)
 -- =====================================================================
 
 local sort_by_game = true       -- move replays into folders organized by game
+local use_active_program = true -- no game detected: name the folder after the focused program (Discord, Chrome...); system stuff -> fallback_folder
 local overlay_enabled = true
 local overlay_duration = 3      -- seconds
 local overlay_margin = 20       -- px from top/right edge
@@ -197,6 +235,26 @@ local function winapi_init()
                            uint32_t flags, void* env, const uint16_t* cwd,
                            STARTUPINFOW_L* si, PROCESS_INFORMATION_L* pi);
         int CloseHandle(void* h);
+
+        typedef struct { int32_t left, top, right, bottom; } RECT_L;
+        typedef struct { uint32_t cbSize; RECT_L rcMonitor; RECT_L rcWork; uint32_t dwFlags; } MONITORINFO_L;
+
+        void* GetForegroundWindow(void);
+        void* GetTopWindow(void* hwnd);
+        void* GetWindow(void* hwnd, uint32_t cmd);
+        int IsWindowVisible(void* hwnd);
+        int IsIconic(void* hwnd);
+        int GetWindowRect(void* hwnd, RECT_L* r);
+        void* MonitorFromWindow(void* hwnd, uint32_t flags);
+        int GetMonitorInfoW(void* mon, MONITORINFO_L* mi);
+        uint32_t GetWindowThreadProcessId(void* hwnd, uint32_t* pid);
+        void* OpenProcess(uint32_t access, int inherit, uint32_t pid);
+        int QueryFullProcessImageNameW(void* proc, uint32_t flags, uint16_t* buf, uint32_t* size);
+        int WideCharToMultiByte(uint32_t cp, uint32_t flags, const uint16_t* ws, int n,
+                                char* out, int outn, const char* def, int* used);
+        int RemoveDirectoryW(const uint16_t* path);
+        int32_t GetWindowLongW(void* hwnd, int idx);
+        int32_t DwmGetWindowAttribute(void* hwnd, uint32_t attr, void* pv, uint32_t cb);
     ]]
     winapi_ready = true
 end
@@ -224,6 +282,205 @@ local function run_hidden(cmdline)
         return true
     end
     return false
+end
+
+
+-- ---------------------------------------------------------------------
+-- Helpers: remove empty folder, verify that the game really has a
+-- visible fullscreen window
+-- ---------------------------------------------------------------------
+
+local function to_wide(str)
+    local ffi = require("ffi")
+    local n = ffi.C.MultiByteToWideChar(65001, 0, str, -1, nil, 0)
+    local buf = ffi.new("uint16_t[?]", n)
+    ffi.C.MultiByteToWideChar(65001, 0, str, -1, buf, n)
+    return buf
+end
+
+-- RemoveDirectory fails on a non-empty folder, so this is safe:
+-- only an EMPTY folder gets deleted.
+local function remove_dir_if_empty(dir)
+    winapi_init()
+    local ffi = require("ffi")
+    local wdir = to_wide((dir:gsub("/", "\\")))
+    return ffi.C.RemoveDirectoryW(wdir) ~= 0
+end
+
+local function exe_basename(path)
+    local name = path:match("([^\\/]+)$")
+    if name == nil then return nil end
+    return name:lower()
+end
+
+local function window_exe_path(hwnd)
+    local ffi = require("ffi")
+    local C = ffi.C
+    local pid = ffi.new("uint32_t[1]")
+    C.GetWindowThreadProcessId(hwnd, pid)
+    local proc = C.OpenProcess(0x1000, 0, pid[0]) -- PROCESS_QUERY_LIMITED_INFORMATION
+    if proc == nil then
+        return nil
+    end
+    local buf = ffi.new("uint16_t[1024]")
+    local size = ffi.new("uint32_t[1]", 1024)
+    local ok = C.QueryFullProcessImageNameW(proc, 0, buf, size)
+    C.CloseHandle(proc)
+    if ok == 0 then
+        return nil
+    end
+    local out = ffi.new("char[2048]")
+    local n = C.WideCharToMultiByte(65001, 0, buf, size[0], out, 2048, nil, nil)
+    if n <= 0 then
+        return nil
+    end
+    return ffi.string(out, n)
+end
+
+local dwm_lib = nil
+local function window_is_cloaked(hwnd)
+    local ffi = require("ffi")
+    if dwm_lib == nil then
+        local ok, lib = pcall(ffi.load, "dwmapi")
+        dwm_lib = ok and lib or false
+    end
+    if not dwm_lib then
+        return false
+    end
+    local v = ffi.new("int[1]")
+    local hr = dwm_lib.DwmGetWindowAttribute(hwnd, 14, v, 4) -- DWMWA_CLOAKED
+    return hr == 0 and v[0] ~= 0
+end
+
+-- detect_game.dll only looks at window SIZE, so a hidden/minimized/cloaked window
+-- of a tray app (Teams, etc.) can be reported as a "game".
+-- Here we check that this exe has a really visible window covering its monitor.
+-- If anything goes wrong in the check, we trust the DLL (old behaviour).
+local function game_has_fullscreen_window(game_path)
+    local ok, res = pcall(function()
+        winapi_init()
+        local ffi = require("ffi")
+        local C = ffi.C
+
+        local target = exe_basename(game_path)
+        if target == nil or target:find("[\128-\255]") then
+            return true -- non-ASCII name: cannot compare reliably, trust the DLL
+        end
+
+        local bit = require("bit")
+        local rect = ffi.new("RECT_L")
+        local mi = ffi.new("MONITORINFO_L")
+        mi.cbSize = ffi.sizeof(mi)
+
+        local h = C.GetTopWindow(nil)
+        local guard = 0
+        while h ~= nil and guard < 5000 do
+            guard = guard + 1
+            -- skip overlay-like windows: NOACTIVATE (0x08000000), TRANSPARENT (0x20), TOOLWINDOW (0x80)
+            local ex = C.GetWindowLongW(h, -20) -- GWL_EXSTYLE
+            local is_overlay = bit.band(ex, 0x08000000) ~= 0 or bit.band(ex, 0x20) ~= 0 or bit.band(ex, 0x80) ~= 0
+
+            if not is_overlay and C.IsWindowVisible(h) ~= 0 and C.IsIconic(h) == 0 and not window_is_cloaked(h) then
+                if C.GetWindowRect(h, rect) ~= 0 then
+                    local mon = C.MonitorFromWindow(h, 2) -- MONITOR_DEFAULTTONEAREST
+                    if mon ~= nil and C.GetMonitorInfoW(mon, mi) ~= 0 then
+                        local m = mi.rcMonitor
+                        if rect.left <= m.left and rect.top <= m.top
+                            and rect.right >= m.right and rect.bottom >= m.bottom then
+                            local exe = window_exe_path(h)
+                            if exe ~= nil and exe_basename(exe) == target then
+                                return true
+                            end
+                        end
+                    end
+                end
+            end
+            h = C.GetWindow(h, 2) -- GW_HWNDNEXT
+        end
+        return false
+    end)
+
+    if not ok then
+        print("Fullscreen check failed (" .. tostring(res) .. "), trusting detect_game.dll")
+        return true
+    end
+    return res
+end
+
+-- ---------------------------------------------------------------------
+-- Program classification: "real program" (folder = its name) vs
+-- "system/shell stuff" (folder = fallback, e.g. Desktop)
+-- ---------------------------------------------------------------------
+
+local function program_name_from_path(path)
+    local base = path:match("([^\\/]+)$")
+    if base == nil then return nil end
+    return (base:gsub("%.[eE][xX][eE]$", ""))
+end
+
+-- Anything that lives inside the Windows folder or is a built-in Windows
+-- shell package (Start feed, widgets, search, Game Bar...) is never a game/app.
+-- Games from the Microsoft Store (WindowsApps\Microsoft.Minecraft..., XboxGames) are NOT affected.
+local function is_system_path(path)
+    local p = path:gsub("/", "\\"):lower()
+    local win = ((os.getenv("SystemRoot") or "C:\\Windows"):gsub("/", "\\"):lower()) .. "\\"
+    if p:sub(1, #win) == win then
+        return true
+    end
+    local patterns = {
+        "\\windowsapps\\microsoftwindows%.",
+        "\\windowsapps\\microsoft%.windows%.",
+        "\\windowsapps\\microsoft%.xboxgamingoverlay",
+        "\\windowsapps\\microsoft%.xbox%.tcui",
+    }
+    for _, pat in ipairs(patterns) do
+        if p:find(pat) then
+            return true
+        end
+    end
+    return false
+end
+
+local function is_ignored_program(path, name)
+    if is_system_path(path) then
+        return true, "system path"
+    end
+    if name ~= nil and ignored_exes[name:lower()] then
+        return true, "ignored programs list"
+    end
+    return false
+end
+
+-- Program that currently has focus (Discord, Chrome, ...). nil when focus is on
+-- Explorer / desktop / taskbar / OBS itself / any system or ignored process.
+local function get_foreground_program_title()
+    local ok, res = pcall(function()
+        winapi_init()
+        local ffi = require("ffi")
+        local hwnd = ffi.C.GetForegroundWindow()
+        if hwnd == nil then
+            return nil
+        end
+        local exe = window_exe_path(hwnd)
+        if exe == nil then
+            return nil
+        end
+        local name = program_name_from_path(exe)
+        if name == nil or name == "" then
+            return nil
+        end
+        local ignored, why = is_ignored_program(exe, name)
+        if ignored then
+            print("Active program '" .. name .. "' ignored (" .. why .. ")")
+            return nil
+        end
+        return name
+    end)
+    if not ok then
+        print("Active program check failed: " .. tostring(res))
+        return nil
+    end
+    return res
 end
 
 local function launch_screen_overlay()
@@ -264,6 +521,7 @@ function script_load(settings)
     detect_game = ffi.load(script_path() .. "detect_game.dll")
 
     load_custom_names()
+    load_ignored_programs()
 
     -- optional extra hotkey: saves the replay buffer (event + overlay follow automatically)
     hotkey_id = obs.obs_hotkey_register_frontend("replay_save_hotkey", "Save replay buffer (ReplayFolders script)", function(pressed)
@@ -296,6 +554,8 @@ end
 
 function script_defaults(settings)
     obs.obs_data_set_default_bool(settings, "sort_by_game", true)
+    obs.obs_data_set_default_string(settings, "fallback_folder", "Desktop")
+    obs.obs_data_set_default_bool(settings, "use_active_program", true)
     obs.obs_data_set_default_bool(settings, "ov_enabled", true)
     obs.obs_data_set_default_int(settings, "ov_duration", 3)
     obs.obs_data_set_default_int(settings, "ov_margin", 20)
@@ -307,6 +567,8 @@ end
 
 function script_update(settings)
     sort_by_game = obs.obs_data_get_bool(settings, "sort_by_game")
+    fallback_folder = obs.obs_data_get_string(settings, "fallback_folder")
+    use_active_program = obs.obs_data_get_bool(settings, "use_active_program")
     overlay_enabled = obs.obs_data_get_bool(settings, "ov_enabled")
     overlay_duration = obs.obs_data_get_int(settings, "ov_duration")
     overlay_margin = obs.obs_data_get_int(settings, "ov_margin")
@@ -320,6 +582,10 @@ function script_properties()
     local props = obs.obs_properties_create()
 
     obs.obs_properties_add_bool(props, "sort_by_game", "Sort replays into game folders  ({game}/{your_path_at_settings})")
+
+    obs.obs_properties_add_bool(props, "use_active_program", "No game detected: use the focused program name as folder (Discord, Chrome...)")
+
+    obs.obs_properties_add_text(props, "fallback_folder", "Folder for system windows / Explorer / unknown (empty = don't move)", obs.OBS_TEXT_DEFAULT)
 
     local overlay_group = obs.obs_properties_create()
     obs.obs_properties_add_bool(overlay_group, "ov_enabled", "Show overlay on replay save")
@@ -348,14 +614,22 @@ function obs_frontend_callback(event)
         if sort_by_game then
             local path = get_replay_buffer_output()
             local original_folder = get_running_game_title()
+            if original_folder == nil and use_active_program then
+                original_folder = get_foreground_program_title()
+            end
 
-            local folder = rename_game_title(original_folder)
+            local folder
+            if original_folder ~= nil then
+                folder = rename_game_title(original_folder)
+            elseif fallback_folder ~= nil and fallback_folder ~= "" then
+                folder = fallback_folder
+            end
 
             if path ~= nil and folder ~= nil then
                 move(path, folder)
             else
                 print("Replay not moved. path=" .. tostring(path) .. ", game=" .. tostring(folder) ..
-                      " (game not detected as fullscreen?)")
+                      " (no game detected and no fallback folder set)")
             end
         end
 
@@ -385,16 +659,20 @@ function get_running_game_title()
     if len == 0 then
         return nil
     end
-    local max = len - 4
-    local i = max
-    while i > 1 do
-        local char = result:sub(i, i)
-        if char == "\\" or char == "/" then
-            break
-        end
-        i = i - 1
+    local name = program_name_from_path(result)
+    if name == nil or name == "" then
+        return nil
     end
-    return result:sub(i + 1, max)
+    local ignored, why = is_ignored_program(result, name)
+    if ignored then
+        print("Ignoring '" .. name .. "' (" .. why .. ")")
+        return nil
+    end
+    if not game_has_fullscreen_window(result) then
+        print("Ignoring '" .. result .. "': no visible fullscreen window (not a game)")
+        return nil
+    end
+    return name
 end
 
 function move(path, folder)
@@ -426,6 +704,10 @@ function move(path, folder)
     local result = obs.os_rename(path, adjusted_path)
     if result == 0 then
         print("Moved replay to: " .. adjusted_path)
+        -- the original date folder is now empty -> remove it (non-empty folders are never deleted)
+        if root_dir ~= new_root and remove_dir_if_empty(root_dir) then
+            print("Removed empty folder: " .. root_dir)
+        end
     else
         print("Failed to move replay (code " .. tostring(result) .. "): " .. path .. " -> " .. adjusted_path)
     end
