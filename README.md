@@ -51,7 +51,6 @@ The notification does not steal focus from your game, ignores mouse clicks and d
 
 5. Enable the Replay Buffer in **Settings → Output → Replay Buffer**.
 
----
 
 ## Requirements
 
@@ -59,7 +58,6 @@ The notification does not steal focus from your game, ignores mouse clicks and d
 - OBS Studio (with the **Replay Buffer** enabled)
 - Windows PowerShell 5.1 (preinstalled on Windows 10/11)
 
----
 
 ## Usage
 
@@ -70,7 +68,6 @@ Save a replay the way you normally do. The script reacts to OBS's "replay buffer
 
 After the replay is saved, the script detects the fullscreen game, moves the file into `Game/date/` and shows the notification.
 
----
 
 ## Result
 
@@ -94,7 +91,6 @@ HUB/
     └── 12_30_05.mkv
 ```
 
----
 
 ## Settings
 
@@ -114,7 +110,6 @@ Open **Tools → Scripts** and select the script.
 
 Animation timings can be changed at the top of `saved_notification/overlay.ps1`: `$inMs`, `$outMs`, `$slideDist`.
 
----
 
 ## Custom game names
 
@@ -132,7 +127,6 @@ Characters that are not allowed in Windows folder names (`< > : " / \ | ? *`) ar
 
 The file is read when the script loads. After editing it, reload the script in OBS (the reload button in the Scripts window).
 
----
 
 ## How it works
 
@@ -140,7 +134,6 @@ The file is read when the script loads. After editing it, reload the script in O
 2. When OBS fires `REPLAY_BUFFER_SAVED`, the script reads the path of the last replay and moves it to `<root>/<game>/<date>/<file>`.
 3. The notification is launched with `CreateProcessW` + `CREATE_NO_WINDOW`, so no console window appears. `overlay.ps1` draws a non-activating, click-through, topmost window and animates it.
 
----
 
 ## Limitations
 
@@ -150,7 +143,6 @@ The file is read when the script loads. After editing it, reload the script in O
   - It cannot be drawn over games running in true exclusive fullscreen mode. Use borderless mode or the `Canvas` mode.
 - Only **new** replays are sorted. Existing files are not touched.
 
----
 
 ## Troubleshooting
 
@@ -166,7 +158,6 @@ Open **Tools → Scripts → Script Log** and look for these messages:
 
 If you can't create or edit files in the script folder, move the whole folder out of `Program Files` (or another protected location).
 
----
 
 ## Credits
 
