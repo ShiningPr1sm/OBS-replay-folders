@@ -83,6 +83,9 @@ end
 -- =====================================================================
 
 local sort_by_game = true       -- move replays into folders organized by game
+local DEFAULT_DATE_PATTERN = "{DD}_{MM}_{YYYY}"
+local date_pattern = DEFAULT_DATE_PATTERN -- derived from the date folder name the user typed ("" = no date folder)
+local folder_order = "game_date"        -- "game_date" (Game/Date) | "date_game" (Date/Game)
 local use_active_program = true -- no game detected: name the folder after the focused program (Discord, Chrome...); system stuff -> fallback_folder
 local overlay_enabled = true
 local overlay_duration = 3      -- seconds
@@ -112,7 +115,6 @@ local function overlay_create_source()
     obs.obs_data_set_obj(s, "font", font)
     obs.obs_data_release(font)
 
-    -- green rectangle behind the text: RGB(46, 204, 113)
     local a = math.floor(255 * overlay_back_opacity / 100 + 0.5)
     obs.obs_data_set_int(s, "back_color", make_color(46, 204, 113, a))
 
@@ -157,7 +159,6 @@ local function overlay_hide()
 end
 
 function overlay_show_canvas()
-    -- (re)create the source on first use
     if overlay_source == nil then
         overlay_create_source()
     else
@@ -169,7 +170,6 @@ function overlay_show_canvas()
         return
     end
 
-    -- make sure it is not shown in some other scene already
     local already = overlay_sceneitem ~= nil
     if already then
         overlay_hide()
@@ -183,7 +183,6 @@ function overlay_show_canvas()
     overlay_sceneitem = obs.obs_scene_add(scene, overlay_source)
     obs.obs_source_release(scene_source)
 
-    -- position: top-right corner with a margin
     local cx, cy = 1920, 1080
     local ovi = obs.obs_video_info()
     if obs.obs_get_video_info(ovi) then
@@ -198,7 +197,6 @@ function overlay_show_canvas()
     pos.y = overlay_margin
     obs.obs_sceneitem_set_pos(overlay_sceneitem, pos)
 
-    -- show for N seconds, then hide
     obs.timer_remove(overlay_hide)
     obs.timer_add(overlay_hide, math.max(1, overlay_duration) * 1000)
 end
@@ -252,7 +250,6 @@ local function winapi_init()
         int QueryFullProcessImageNameW(void* proc, uint32_t flags, uint16_t* buf, uint32_t* size);
         int WideCharToMultiByte(uint32_t cp, uint32_t flags, const uint16_t* ws, int n,
                                 char* out, int outn, const char* def, int* used);
-        int RemoveDirectoryW(const uint16_t* path);
         int32_t GetWindowLongW(void* hwnd, int idx);
         int32_t DwmGetWindowAttribute(void* hwnd, uint32_t attr, void* pv, uint32_t cb);
     ]]
@@ -286,26 +283,8 @@ end
 
 
 -- ---------------------------------------------------------------------
--- Helpers: remove empty folder, verify that the game really has a
--- visible fullscreen window
+-- Helpers: verify that the game really has a visible fullscreen window
 -- ---------------------------------------------------------------------
-
-local function to_wide(str)
-    local ffi = require("ffi")
-    local n = ffi.C.MultiByteToWideChar(65001, 0, str, -1, nil, 0)
-    local buf = ffi.new("uint16_t[?]", n)
-    ffi.C.MultiByteToWideChar(65001, 0, str, -1, buf, n)
-    return buf
-end
-
--- RemoveDirectory fails on a non-empty folder, so this is safe:
--- only an EMPTY folder gets deleted.
-local function remove_dir_if_empty(dir)
-    winapi_init()
-    local ffi = require("ffi")
-    local wdir = to_wide((dir:gsub("/", "\\")))
-    return ffi.C.RemoveDirectoryW(wdir) ~= 0
-end
 
 local function exe_basename(path)
     local name = path:match("([^\\/]+)$")
@@ -510,6 +489,144 @@ function overlay_show()
 end
 
 -- =====================================================================
+-- Date folder (computer's local time, user-editable name)
+-- =====================================================================
+
+-- The user types the folder name exactly as it should look for today's date
+-- (e.g. 17.11.2026). The script finds the day / month / year inside that text
+-- and stores a pattern like "{DD}.{MM}.{YYYY}", so the name updates every day.
+
+local function pad2(n)
+    return string.format("%02d", n)
+end
+
+local function date_key(t)
+    return string.format("%04d-%02d-%02d", t.year, t.month, t.day)
+end
+
+local function parse_date_key(str)
+    local y, m, d = (str or ""):match("^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
+    if y == nil then
+        return nil
+    end
+    return { year = tonumber(y), month = tonumber(m), day = tonumber(d) }
+end
+
+local function render_date_pattern(pattern, t)
+    local values = {
+        DD = pad2(t.day), D = tostring(t.day),
+        MM = pad2(t.month), M = tostring(t.month),
+        YYYY = string.format("%04d", t.year), YY = pad2(t.year % 100),
+    }
+    return (pattern:gsub("{(%u+)}", function(k) return values[k] end))
+end
+
+local function date_token_field(token)
+    return token:sub(1, 1) -- DD/D -> D, MM/M -> M, YYYY/YY -> Y
+end
+
+-- text: what the user typed; ref: the date this text was written for;
+-- hint: previous pattern (only used to resolve ambiguity, e.g. day == month)
+local function derive_date_pattern(text, ref, hint)
+    local hint_tokens = {}
+    for token in (hint or ""):gmatch("{(%u+)}") do
+        hint_tokens[#hint_tokens + 1] = token
+    end
+
+    local out, used, count, pos = {}, {}, 0, 1
+    while pos <= #text do
+        local s_, e_ = text:find("%d+", pos)
+        if s_ == nil then
+            break
+        end
+        out[#out + 1] = text:sub(pos, s_ - 1)
+        local g = text:sub(s_, e_)
+        local n = tonumber(g)
+
+        local cands = {}
+        if #g == 4 and n == ref.year then
+            cands[#cands + 1] = "YYYY"
+        elseif #g == 2 then
+            if g == pad2(ref.day) then cands[#cands + 1] = "DD" end
+            if g == pad2(ref.month) then cands[#cands + 1] = "MM" end
+            if g == pad2(ref.year % 100) then cands[#cands + 1] = "YY" end
+        elseif #g == 1 then
+            if g == tostring(ref.day) then cands[#cands + 1] = "D" end
+            if g == tostring(ref.month) then cands[#cands + 1] = "M" end
+        end
+
+        local pick = nil
+        local want = hint_tokens[count + 1]
+        for _, c in ipairs(cands) do
+            if c == want and not used[date_token_field(c)] then
+                pick = c
+            end
+        end
+        if pick == nil then
+            for _, c in ipairs(cands) do
+                if not used[date_token_field(c)] then
+                    pick = c
+                    break
+                end
+            end
+        end
+
+        if pick ~= nil then
+            out[#out + 1] = "{" .. pick .. "}"
+            used[date_token_field(pick)] = true
+            count = count + 1
+        else
+            out[#out + 1] = g
+        end
+        pos = e_ + 1
+    end
+    out[#out + 1] = text:sub(pos)
+    return table.concat(out)
+end
+
+local function sanitize_folder_name(name)
+    name = name:gsub('[<>:"/\\|?*%c]', "_")
+    name = name:gsub("[%s%.]+$", "") -- Windows strips trailing spaces/dots
+    return (name:match("^%s*(.-)$"))
+end
+
+local function sync_date_settings(settings)
+    local today = os.date("*t")
+    local pattern = obs.obs_data_get_string(settings, "date_pattern")
+    local text = obs.obs_data_get_string(settings, "date_example")
+    local ref_key = obs.obs_data_get_string(settings, "date_example_for")
+    local ref = parse_date_key(ref_key)
+    if ref == nil then
+        ref = today
+        ref_key = date_key(today)
+    end
+
+    if text ~= render_date_pattern(pattern, ref) then
+        pattern = derive_date_pattern(text, ref, pattern)
+        obs.obs_data_set_string(settings, "date_pattern", pattern)
+        obs.obs_data_set_string(settings, "date_example_for", ref_key)
+    elseif ref_key ~= date_key(today) then
+        obs.obs_data_set_string(settings, "date_example", render_date_pattern(pattern, today))
+        obs.obs_data_set_string(settings, "date_example_for", date_key(today))
+    end
+    date_pattern = pattern
+end
+
+local function order_preview(order, date_name)
+    local game = "Game"
+    if date_name == nil then
+        return "Preview: invalid date folder"
+    end
+    if date_name == "" then
+        return "Preview: " .. game .. " (no date folder)"
+    end
+    if order == "date_game" then
+        return "Preview: " .. date_name .. " > " .. game
+    end
+    return "Preview: " .. game .. " > " .. date_name
+end
+
+-- =====================================================================
 -- Game detection / folder logic
 -- =====================================================================
 
@@ -523,7 +640,6 @@ function script_load(settings)
     load_custom_names()
     load_ignored_programs()
 
-    -- optional extra hotkey: saves the replay buffer (event + overlay follow automatically)
     hotkey_id = obs.obs_hotkey_register_frontend("replay_save_hotkey", "Save replay buffer (ReplayFolders script)", function(pressed)
         if pressed then
             obs.obs_frontend_replay_buffer_save()
@@ -556,6 +672,9 @@ function script_defaults(settings)
     obs.obs_data_set_default_bool(settings, "sort_by_game", true)
     obs.obs_data_set_default_string(settings, "fallback_folder", "Desktop")
     obs.obs_data_set_default_bool(settings, "use_active_program", true)
+    obs.obs_data_set_default_string(settings, "date_pattern", DEFAULT_DATE_PATTERN)
+    obs.obs_data_set_default_string(settings, "date_example", render_date_pattern(DEFAULT_DATE_PATTERN, os.date("*t")))
+    obs.obs_data_set_default_string(settings, "folder_order", "game_date")
     obs.obs_data_set_default_bool(settings, "ov_enabled", true)
     obs.obs_data_set_default_int(settings, "ov_duration", 3)
     obs.obs_data_set_default_int(settings, "ov_margin", 20)
@@ -566,9 +685,11 @@ function script_defaults(settings)
 end
 
 function script_update(settings)
+    sync_date_settings(settings)
     sort_by_game = obs.obs_data_get_bool(settings, "sort_by_game")
     fallback_folder = obs.obs_data_get_string(settings, "fallback_folder")
     use_active_program = obs.obs_data_get_bool(settings, "use_active_program")
+    folder_order = obs.obs_data_get_string(settings, "folder_order")
     overlay_enabled = obs.obs_data_get_bool(settings, "ov_enabled")
     overlay_duration = obs.obs_data_get_int(settings, "ov_duration")
     overlay_margin = obs.obs_data_get_int(settings, "ov_margin")
@@ -581,11 +702,38 @@ end
 function script_properties()
     local props = obs.obs_properties_create()
 
-    obs.obs_properties_add_bool(props, "sort_by_game", "Sort replays into game folders  ({game}/{your_path_at_settings})")
+    local folders = obs.obs_properties_create()
 
-    obs.obs_properties_add_bool(props, "use_active_program", "No game detected: use the focused program name as folder (Discord, Chrome...)")
+    local order = obs.obs_properties_add_list(folders, "folder_order", "Folder order",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(order, "Game > Date", "game_date")
+    obs.obs_property_list_add_string(order, "Date > Game", "date_game")
 
-    obs.obs_properties_add_text(props, "fallback_folder", "Folder for system windows / Explorer / unknown (empty = don't move)", obs.OBS_TEXT_DEFAULT)
+    local date_prop = obs.obs_properties_add_text(folders, "date_example", "Date folder name", obs.OBS_TEXT_DEFAULT)
+    obs.obs_property_set_long_description(date_prop,
+        "Filled with today's date from your computer. Write it however you like (17.11.2026, 2026-11-17, Clips 17.11...). Day, month and year update automatically every day. Empty = no date folder.")
+    local preview_prop = obs.obs_properties_add_text(folders, "date_preview", "", obs.OBS_TEXT_INFO)
+    obs.obs_property_set_description(preview_prop, order_preview(folder_order, sanitize_folder_name(render_date_pattern(date_pattern, os.date("*t")))))
+
+    local function refresh_preview(p, _, settings)
+        local txt = obs.obs_data_get_string(settings, "date_example")
+        local ord = obs.obs_data_get_string(settings, "folder_order")
+        local pp = obs.obs_properties_get(p, "date_preview")
+        obs.obs_property_set_description(pp, order_preview(ord, sanitize_folder_name(txt)))
+        return true
+    end
+    obs.obs_property_set_modified_callback(date_prop, refresh_preview)
+    obs.obs_property_set_modified_callback(order, refresh_preview)
+
+    local active_prop = obs.obs_properties_add_bool(folders, "use_active_program", "Use focused app name")
+    obs.obs_property_set_long_description(active_prop,
+        "No game detected: name the folder after the focused program (Discord, Chrome...). System windows and Explorer always go to the folder below.")
+
+    local fallback_prop = obs.obs_properties_add_text(folders, "fallback_folder", "System / unknown folder", obs.OBS_TEXT_DEFAULT)
+    obs.obs_property_set_long_description(fallback_prop,
+        "Folder for clips made from Explorer, system windows or unknown programs. Empty = don't move such clips.")
+
+    obs.obs_properties_add_group(props, "sort_by_game", "Sort replays into game / date folders", obs.OBS_GROUP_CHECKABLE, folders)
 
     local overlay_group = obs.obs_properties_create()
     obs.obs_properties_add_bool(overlay_group, "ov_enabled", "Show overlay on replay save")
@@ -683,31 +831,34 @@ function move(path, folder)
         print("move(): cannot parse path: " .. path)
         return
     end
-    local date_folder = root_dir:match("([^/]+)/*$")
+
     local file_name = path:match("([^/]+)$")
-
-    local base_dir = root_dir:sub(1, root_dir:len() - date_folder:len() - 1)
-
+    local base_dir = root_dir
     folder = folder:gsub('[<>:"/\\|?*]', "_")
 
-    local game_dir = base_dir .. "/" .. folder
-    local new_root = game_dir .. "/" .. date_folder
-    local adjusted_path = new_root .. "/" .. file_name
+    local new_date = sanitize_folder_name(render_date_pattern(date_pattern, os.date("*t")))
 
-    if not obs.os_file_exists(game_dir) then
-        obs.os_mkdir(game_dir)
+    local levels = {}
+    if folder_order == "date_game" then
+        if new_date ~= "" then table.insert(levels, new_date) end
+        table.insert(levels, folder)
+    else
+        table.insert(levels, folder)
+        if new_date ~= "" then table.insert(levels, new_date) end
     end
-    if not obs.os_file_exists(new_root) then
-        obs.os_mkdir(new_root)
+
+    local new_root = base_dir
+    for _, level in ipairs(levels) do
+        new_root = new_root .. "/" .. level
+        if not obs.os_file_exists(new_root) then
+            obs.os_mkdir(new_root)
+        end
     end
+    local adjusted_path = new_root .. "/" .. file_name
 
     local result = obs.os_rename(path, adjusted_path)
     if result == 0 then
         print("Moved replay to: " .. adjusted_path)
-        -- the original date folder is now empty -> remove it (non-empty folders are never deleted)
-        if root_dir ~= new_root and remove_dir_if_empty(root_dir) then
-            print("Removed empty folder: " .. root_dir)
-        end
     else
         print("Failed to move replay (code " .. tostring(result) .. "): " .. path .. " -> " .. adjusted_path)
     end
